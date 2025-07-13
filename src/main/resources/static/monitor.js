@@ -187,13 +187,33 @@ class ErrorHandler {
 
 // API调用封装
 class ApiClient {
-    static async get(url, context = '') {
-        try {
-            const response = await fetch(url);
-            return await ErrorHandler.handleApiResponse(response, context);
-        } catch (error) {
-            ErrorHandler.showError(error, context);
-            throw error;
+    static async get(url, context = '', retries = 3) {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
+                
+                const response = await fetch(url, {
+                    signal: controller.signal,
+                    headers: {
+                        'X-Request-ID': `${Date.now()}-${Math.random()}`
+                    }
+                });
+                
+                clearTimeout(timeoutId);
+                return await ErrorHandler.handleApiResponse(response, context);
+                
+            } catch (error) {
+                console.error(`API请求失败 (尝试 ${attempt}/${retries}):`, error);
+                
+                if (attempt === retries) {
+                    ErrorHandler.showError(error, context);
+                    throw error;
+                }
+                
+                // 指数退避重试
+                await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000));
+            }
         }
     }
     
@@ -231,8 +251,12 @@ class MigrationMonitor {
         this.tasks = new Map();
         this.autoRefreshEnabled = true;
         this.refreshInterval = null;
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = 5;
+        this.reconnectDelay = 5000;
         
         this.init();
+        this.bindPageUnloadEvents();
     }
     
     init() {
@@ -313,10 +337,8 @@ class MigrationMonitor {
             this.isConnected = false;
             this.addLog('WebSocket连接失败: ' + error, 'error');
             
-            // 尝试重连
-            setTimeout(() => {
-                this.connectWebSocket();
-            }, 5000);
+            // 智能重连机制
+            this.handleReconnect();
         });
     }
     
@@ -367,9 +389,19 @@ class MigrationMonitor {
         this.addLog(`警告: ${message.warningMessage}`, 'warning');
     }
     
+    // 显示/隐藏加载指示器
+    showLoading(show = true) {
+        const indicator = document.getElementById('loadingIndicator');
+        if (indicator) {
+            indicator.style.display = show ? 'block' : 'none';
+        }
+    }
+    
     // 加载初始数据
     async loadInitialData() {
         try {
+            this.showLoading(true);
+            
             // 立即尝试初始化图表
             this.initializeCharts();
             
@@ -409,6 +441,8 @@ class MigrationMonitor {
         } catch (error) {
             console.error('加载初始数据失败:', error);
             this.addLog('加载初始数据失败: ' + error.message, 'error');
+        } finally {
+            this.showLoading(false);
         }
     }
     
@@ -1042,36 +1076,52 @@ class MigrationMonitor {
     
     // 创建任务
     async createTask() {
-        const taskType = document.getElementById('taskType').value;
-        
-        let config = {};
-        let url = '';
-        
-        if (taskType === 'FULL_MIGRATION' || taskType === 'INCREMENTAL_MIGRATION') {
-            config = {
-                sourceIndex: document.getElementById('sourceIndex').value,
-                targetIndex: document.getElementById('targetIndex').value,
-                batchSize: parseInt(document.getElementById('batchSize').value),
-                threadCount: parseInt(document.getElementById('threadCount').value),
-                scrollTimeout: 5,
-                overwriteExisting: true
-            };
-            url = taskType === 'FULL_MIGRATION' ? '/api/monitor/tasks/migration/full' : '/api/monitor/tasks/migration/incremental';
-        } else if (taskType === 'INDEX_SYNC') {
-            const indexNames = document.getElementById('indexNames').value;
-            config = {
-                indexNames: indexNames ? indexNames.split(',').map(s => s.trim()) : null,
-                batchSize: parseInt(document.getElementById('batchSize').value),
-                threadCount: parseInt(document.getElementById('threadCount').value),
-                syncData: document.getElementById('syncData').checked,
-                syncMappings: document.getElementById('syncMappings').checked,
-                syncSettings: document.getElementById('syncSettings').checked,
-                syncAliases: true,
-                validateConnection: true,
-                validateData: true
-            };
-            url = '/api/monitor/tasks/sync';
-        }
+        try {
+            const taskType = document.getElementById('taskType').value;
+            
+            // 输入验证
+            const validationResult = this.validateTaskInputs(taskType);
+            if (!validationResult.valid) {
+                ErrorHandler.showToast(validationResult.message, 'error');
+                return;
+            }
+            
+            let config = {};
+            let url = '';
+            
+            if (taskType === 'FULL_MIGRATION' || taskType === 'INCREMENTAL_MIGRATION') {
+                const sourceIndex = this.sanitizeInput(document.getElementById('sourceIndex').value);
+                const targetIndex = this.sanitizeInput(document.getElementById('targetIndex').value);
+                const batchSize = parseInt(document.getElementById('batchSize').value);
+                const threadCount = parseInt(document.getElementById('threadCount').value);
+                
+                config = {
+                    sourceIndex: sourceIndex,
+                    targetIndex: targetIndex,
+                    batchSize: Math.min(Math.max(batchSize, 100), 10000), // 限制范围
+                    threadCount: Math.min(Math.max(threadCount, 1), 10), // 限制范围
+                    scrollTimeout: 5,
+                    overwriteExisting: true
+                };
+                url = taskType === 'FULL_MIGRATION' ? '/api/monitor/tasks/migration/full' : '/api/monitor/tasks/migration/incremental';
+            } else if (taskType === 'INDEX_SYNC') {
+                const indexNames = this.sanitizeInput(document.getElementById('indexNames').value);
+                const batchSize = parseInt(document.getElementById('batchSize').value);
+                const threadCount = parseInt(document.getElementById('threadCount').value);
+                
+                config = {
+                    indexNames: indexNames ? indexNames.split(',').map(s => this.sanitizeInput(s.trim())).filter(s => s) : null,
+                    batchSize: Math.min(Math.max(batchSize, 100), 10000),
+                    threadCount: Math.min(Math.max(threadCount, 1), 10),
+                    syncData: document.getElementById('syncData').checked,
+                    syncMappings: document.getElementById('syncMappings').checked,
+                    syncSettings: document.getElementById('syncSettings').checked,
+                    syncAliases: true,
+                    validateConnection: true,
+                    validateData: true
+                };
+                url = '/api/monitor/tasks/sync';
+            }
         
         try {
             const response = await fetch(url, {
@@ -1098,6 +1148,60 @@ class MigrationMonitor {
             console.error('创建任务失败:', error);
             this.addLog('创建任务失败: ' + error.message, 'error');
         }
+    }
+    
+    // 输入验证方法
+    validateTaskInputs(taskType) {
+        if (taskType === 'FULL_MIGRATION' || taskType === 'INCREMENTAL_MIGRATION') {
+            const sourceIndex = document.getElementById('sourceIndex').value.trim();
+            const targetIndex = document.getElementById('targetIndex').value.trim();
+            const batchSize = parseInt(document.getElementById('batchSize').value);
+            const threadCount = parseInt(document.getElementById('threadCount').value);
+            
+            if (!sourceIndex) {
+                return { valid: false, message: '源索引名称不能为空' };
+            }
+            if (!targetIndex) {
+                return { valid: false, message: '目标索引名称不能为空' };
+            }
+            if (sourceIndex === targetIndex) {
+                return { valid: false, message: '源索引和目标索引不能相同' };
+            }
+            if (!this.isValidIndexName(sourceIndex)) {
+                return { valid: false, message: '源索引名称格式不正确' };
+            }
+            if (!this.isValidIndexName(targetIndex)) {
+                return { valid: false, message: '目标索引名称格式不正确' };
+            }
+            if (isNaN(batchSize) || batchSize < 100 || batchSize > 10000) {
+                return { valid: false, message: '批次大小必须在100-10000之间' };
+            }
+            if (isNaN(threadCount) || threadCount < 1 || threadCount > 10) {
+                return { valid: false, message: '线程数必须在1-10之间' };
+            }
+        }
+        
+        return { valid: true };
+    }
+    
+    // 输入清理方法
+    sanitizeInput(input) {
+        if (typeof input !== 'string') return '';
+        
+        // 移除危险字符
+        return input
+            .replace(/[<>\"']/g, '') // 防XSS
+            .replace(/[;|&$`\\]/g, '') // 防命令注入
+            .replace(/\s+/g, ' ') // 标准化空格
+            .trim()
+            .substring(0, 100); // 限制长度
+    }
+    
+    // 验证索引名称格式
+    isValidIndexName(indexName) {
+        // ES索引名称规则：小写字母、数字、- 和 _
+        const pattern = /^[a-z0-9][a-z0-9_-]*$/;
+        return pattern.test(indexName) && indexName.length <= 255;
     }
     
     // 工具方法
@@ -1178,13 +1282,63 @@ class MigrationMonitor {
         this.addLog('任务列表已刷新', 'info');
     }
     
-    // 自动刷新
+    // 智能自动刷新
     startAutoRefresh() {
+        if (this.refreshInterval) {
+            clearInterval(this.refreshInterval);
+        }
+        
+        let refreshCount = 0;
+        const maxRefreshes = 20; // 限制最大刷新次数，防止无限循环
+        
         this.refreshInterval = setInterval(() => {
-            if (this.autoRefreshEnabled && !this.isConnected) {
-                this.loadInitialData();
+            if (!this.autoRefreshEnabled) return;
+            
+            // 如果WebSocket已连接，不需要轮询
+            if (this.isConnected) return;
+            
+            // 防止页面隐藏时继续刷新
+            if (document.hidden) return;
+            
+            refreshCount++;
+            if (refreshCount > maxRefreshes) {
+                console.warn('达到最大刷新次数，停止自动刷新');
+                this.pauseUpdates();
+                this.addLog('自动刷新已暂停，请手动刷新或检查网络连接', 'warning');
+                return;
             }
+            
+            // 只刷新必要的数据，减少服务器压力
+            this.loadEssentialData();
         }, 30000); // 30秒
+    }
+    
+    // 加载关键数据（轻量版）
+    async loadEssentialData() {
+        try {
+            // 只加载任务列表，不加载详细统计
+            const tasksResponse = await ApiClient.get('/api/monitor/tasks', '轮询模式获取任务列表');
+            if (tasksResponse.success) {
+                this.updateTaskList(tasksResponse.tasks);
+            }
+        } catch (error) {
+            console.error('轮询模式加载数据失败:', error);
+            // 降级处理：延长刷新间隔
+            this.degradeRefreshInterval();
+        }
+    }
+    
+    // 降级刷新间隔
+    degradeRefreshInterval() {
+        if (this.refreshInterval) {
+            clearInterval(this.refreshInterval);
+            console.log('网络异常，延长刷新间隔至60秒');
+            this.refreshInterval = setInterval(() => {
+                if (this.autoRefreshEnabled && !this.isConnected && !document.hidden) {
+                    this.loadEssentialData();
+                }
+            }, 60000); // 降级到60秒
+        }
     }
     
     // 绑定事件
@@ -1192,6 +1346,135 @@ class MigrationMonitor {
         document.getElementById('autoRefresh').addEventListener('change', (e) => {
             this.autoRefreshEnabled = e.target.checked;
         });
+        
+        // 页面可见性变化处理
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                this.pauseUpdates();
+            } else {
+                this.resumeUpdates();
+            }
+        });
+        
+        // 页面卸载时清理资源
+        window.addEventListener('beforeunload', () => {
+            this.cleanup();
+        });
+        
+        // 页面错误处理
+        window.addEventListener('error', (event) => {
+            console.error('页面JavaScript错误:', event.error);
+            this.addLog('页面发生错误，建议刷新页面', 'error');
+        });
+    }
+    
+    // 暂停更新
+    pauseUpdates() {
+        this.autoRefreshEnabled = false;
+        const checkbox = document.getElementById('autoRefresh');
+        if (checkbox) checkbox.checked = false;
+        console.log('更新已暂停');
+    }
+    
+    // 恢复更新
+    resumeUpdates() {
+        this.autoRefreshEnabled = true;
+        const checkbox = document.getElementById('autoRefresh');
+        if (checkbox) checkbox.checked = true;
+        // 立即刷新一次数据
+        this.loadInitialData();
+        console.log('更新已恢复');
+    }
+    
+    // 清理资源
+    cleanup() {
+        if (this.refreshInterval) {
+            clearInterval(this.refreshInterval);
+            this.refreshInterval = null;
+        }
+        if (this.stompClient && this.stompClient.connected) {
+            this.stompClient.disconnect();
+            this.stompClient = null;
+        }
+        this.isConnected = false;
+        console.log('监控器资源已清理');
+    }
+    
+    // 绑定页面卸载事件
+    bindPageUnloadEvents() {
+        window.addEventListener('beforeunload', () => {
+            this.cleanup();
+        });
+        
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                // 页面隐藏时减少更新频率
+                this.pauseUpdates();
+            } else {
+                // 页面显示时恢复更新
+                this.resumeUpdates();
+            }
+        });
+    }
+    
+    // 智能重连处理
+    handleReconnect() {
+        if (this.reconnectAttempts < this.maxReconnectAttempts) {
+            this.reconnectAttempts++;
+            const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1); // 指数退避
+            
+            console.log(`WebSocket重连尝试 ${this.reconnectAttempts}/${this.maxReconnectAttempts}，${delay}ms后重试`);
+            this.addLog(`WebSocket重连尝试 ${this.reconnectAttempts}/${this.maxReconnectAttempts}`, 'warning');
+            
+            setTimeout(() => {
+                this.connectWebSocket();
+            }, delay);
+        } else {
+            console.error('WebSocket重连失败，已达到最大重试次数');
+            this.addLog('WebSocket连接彻底失败，请刷新页面重试', 'error');
+            // 切换到轮询模式
+            this.switchToPollingMode();
+        }
+    }
+    
+    // 切换到轮询模式
+    switchToPollingMode() {
+        this.addLog('切换到轮询模式，数据更新可能延迟', 'warning');
+        this.startAutoRefresh();
+    }
+    
+    // 暂停更新
+    pauseUpdates() {
+        if (this.refreshInterval) {
+            clearInterval(this.refreshInterval);
+            this.refreshInterval = null;
+        }
+    }
+    
+    // 恢复更新
+    resumeUpdates() {
+        if (!this.isConnected) {
+            this.startAutoRefresh();
+        }
+    }
+    
+    // 清理资源
+    cleanup() {
+        if (this.stompClient && this.isConnected) {
+            try {
+                this.stompClient.disconnect();
+                console.log('WebSocket连接已断开');
+            } catch (error) {
+                console.error('断开WebSocket连接时出错:', error);
+            }
+        }
+        
+        if (this.refreshInterval) {
+            clearInterval(this.refreshInterval);
+            this.refreshInterval = null;
+        }
+        
+        this.isConnected = false;
     }
 }
 

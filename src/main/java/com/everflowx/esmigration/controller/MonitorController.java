@@ -4,6 +4,7 @@ import com.everflowx.esmigration.domain.IndexSyncConfig;
 import com.everflowx.esmigration.domain.MigrationConfig;
 import com.everflowx.esmigration.domain.MigrationTask;
 import com.everflowx.esmigration.domain.TaskStatus;
+import com.everflowx.esmigration.exception.MigrationConfigException;
 import com.everflowx.esmigration.manager.MigrationTaskManager;
 import com.everflowx.esmigration.service.EsMigrationService;
 import com.everflowx.esmigration.service.EnhancedMigrationService;
@@ -228,8 +229,17 @@ public class MonitorController {
         Map<String, Object> result = new HashMap<>();
         
         try {
+            // 输入安全检查
+            if (config == null) {
+                throw new MigrationConfigException("INVALID_CONFIG", "迁移配置不能为空");
+            }
+            
             // 验证配置
             configValidator.validateMigrationConfig(config);
+            
+            // 安全检查：防止索引名注入
+            validateIndexNameSecurity(config.getSourceIndex());
+            validateIndexNameSecurity(config.getTargetIndex());
             
             // 创建任务
             String taskName = String.format("全量迁移: %s -> %s", config.getSourceIndex(), config.getTargetIndex());
@@ -457,6 +467,73 @@ public class MonitorController {
         
         result.put("timestamp", System.currentTimeMillis());
         return result;
+    }
+    
+    // ========== 安全验证方法 ==========
+    
+    /**
+     * 验证索引名称安全性
+     */
+    private void validateIndexNameSecurity(String indexName) {
+        if (indexName == null || indexName.trim().isEmpty()) {
+            throw new MigrationConfigException("INVALID_INDEX_NAME", "索引名称不能为空");
+        }
+        
+        // 长度检查
+        if (indexName.length() > 255) {
+            throw new MigrationConfigException("INVALID_INDEX_NAME", "索引名称长度不能超过255个字符");
+        }
+        
+        // 字符安全检查
+        String sanitized = indexName.replaceAll("[^a-zA-Z0-9_-]", "");
+        if (!sanitized.equals(indexName)) {
+            throw new MigrationConfigException("INVALID_INDEX_NAME", "索引名称包含非法字符，只允许字母、数字、下划线和连字符");
+        }
+        
+        // 禁用系统索引
+        if (indexName.startsWith(".") || indexName.startsWith("_")) {
+            throw new MigrationConfigException("INVALID_INDEX_NAME", "不允许操作系统索引");
+        }
+        
+        // 危险关键词检查
+        String[] dangerousKeywords = {"delete", "drop", "truncate", "admin", "system"};
+        String lowerIndexName = indexName.toLowerCase();
+        for (String keyword : dangerousKeywords) {
+            if (lowerIndexName.contains(keyword)) {
+                log.warn("检测到潜在危险的索引名称: {}", indexName);
+                // 这里不抛异常，只记录警告，但在生产环境中可能需要更严格的检查
+            }
+        }
+    }
+    
+    /**
+     * 验证批次大小安全性
+     */
+    private void validateBatchSizeSecurity(Integer batchSize) {
+        if (batchSize == null || batchSize <= 0) {
+            throw new MigrationConfigException("INVALID_BATCH_SIZE", "批次大小必须大于0");
+        }
+        
+        if (batchSize > 10000) {
+            throw new MigrationConfigException("INVALID_BATCH_SIZE", "批次大小不能超过10000，防止内存溢出");
+        }
+        
+        if (batchSize < 100) {
+            log.warn("批次大小过小可能影响性能: {}", batchSize);
+        }
+    }
+    
+    /**
+     * 验证线程数安全性
+     */
+    private void validateThreadCountSecurity(Integer threadCount) {
+        if (threadCount == null || threadCount <= 0) {
+            throw new MigrationConfigException("INVALID_THREAD_COUNT", "线程数必须大于0");
+        }
+        
+        if (threadCount > 10) {
+            throw new MigrationConfigException("INVALID_THREAD_COUNT", "线程数不能超过10，防止系统过载");
+        }
     }
     
     // ========== 异步任务执行方法 ==========

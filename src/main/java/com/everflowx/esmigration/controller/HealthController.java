@@ -2,6 +2,7 @@ package com.everflowx.esmigration.controller;
 
 import com.everflowx.esmigration.config.ElasticsearchConfig;
 import com.everflowx.esmigration.exception.GlobalExceptionHandler;
+import com.everflowx.esmigration.manager.MigrationTaskManager;
 import com.everflowx.esmigration.service.EsMigrationService;
 import com.everflowx.esmigration.service.IndexSyncService;
 import io.swagger.annotations.Api;
@@ -11,11 +12,16 @@ import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.client.RestHighLevelClient;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import javax.annotation.Resource;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.OperatingSystemMXBean;
+import java.lang.management.RuntimeMXBean;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -50,6 +56,9 @@ public class HealthController {
     
     @Autowired
     private GlobalExceptionHandler globalExceptionHandler;
+    
+    @Autowired
+    private MigrationTaskManager taskManager;
     
     @ApiOperation("系统健康检查")
     @GetMapping("/check")
@@ -296,5 +305,346 @@ public class HealthController {
         }
         
         return result;
+    }
+    
+    // ==================== 标准健康检查端点 ====================
+    
+    /**
+     * 标准健康检查端点 (符合Spring Boot Actuator规范)
+     */
+    @ApiOperation("标准健康检查")
+    @GetMapping("/actuator")
+    public ResponseEntity<Map<String, Object>> actuatorHealth() {
+        Map<String, Object> health = new HashMap<>();
+        String overallStatus = "UP";
+        
+        try {
+            health.put("timestamp", System.currentTimeMillis());
+            health.put("service", "ES Migration Monitor");
+            health.put("version", "1.0.0");
+            
+            // 检查应用运行状态
+            health.put("app", checkApplicationHealth());
+            
+            // 检查Elasticsearch连接
+            Map<String, Object> esHealth = checkElasticsearchHealth();
+            health.put("elasticsearch", esHealth);
+            if ("DOWN".equals(esHealth.get("status"))) {
+                overallStatus = "DOWN";
+            }
+            
+            // 检查任务管理器状态
+            Map<String, Object> taskHealth = checkTaskManagerHealth();
+            health.put("tasks", taskHealth);
+            if ("WARNING".equals(taskHealth.get("status"))) {
+                overallStatus = "WARNING";
+            }
+            
+            // 检查系统资源
+            Map<String, Object> systemHealth = checkSystemHealth();
+            health.put("system", systemHealth);
+            if ("WARNING".equals(systemHealth.get("status"))) {
+                overallStatus = "WARNING";
+            }
+            
+            health.put("status", overallStatus);
+            
+            // 根据状态返回相应的HTTP状态码
+            if ("DOWN".equals(overallStatus)) {
+                return ResponseEntity.status(503).body(health);
+            } else if ("WARNING".equals(overallStatus)) {
+                return ResponseEntity.status(200).body(health);
+            } else {
+                return ResponseEntity.ok(health);
+            }
+            
+        } catch (Exception e) {
+            health.put("status", "DOWN");
+            health.put("error", e.getMessage());
+            health.put("timestamp", System.currentTimeMillis());
+            return ResponseEntity.status(503).body(health);
+        }
+    }
+
+    /**
+     * 就绪检查
+     */
+    @ApiOperation("就绪检查")
+    @GetMapping("/ready")
+    public ResponseEntity<Map<String, Object>> readiness() {
+        Map<String, Object> ready = new HashMap<>();
+        boolean isReady = true;
+        
+        try {
+            // 检查ES连接
+            if (!isElasticsearchConnected()) {
+                isReady = false;
+                ready.put("elasticsearch", "NOT_READY");
+            } else {
+                ready.put("elasticsearch", "READY");
+            }
+            
+            // 检查任务管理器
+            if (taskManager == null) {
+                isReady = false;
+                ready.put("taskManager", "NOT_READY");
+            } else {
+                ready.put("taskManager", "READY");
+            }
+            
+            ready.put("status", isReady ? "READY" : "NOT_READY");
+            ready.put("timestamp", System.currentTimeMillis());
+            
+            return isReady ? ResponseEntity.ok(ready) : ResponseEntity.status(503).body(ready);
+            
+        } catch (Exception e) {
+            ready.put("status", "ERROR");
+            ready.put("error", e.getMessage());
+            return ResponseEntity.status(503).body(ready);
+        }
+    }
+
+    /**
+     * 存活检查
+     */
+    @ApiOperation("存活检查")
+    @GetMapping("/live")
+    public ResponseEntity<Map<String, Object>> liveness() {
+        Map<String, Object> live = new HashMap<>();
+        
+        try {
+            // 简单的存活检查
+            live.put("status", "ALIVE");
+            live.put("timestamp", System.currentTimeMillis());
+            live.put("uptime", ManagementFactory.getRuntimeMXBean().getUptime());
+            
+            return ResponseEntity.ok(live);
+            
+        } catch (Exception e) {
+            live.put("status", "DEAD");
+            live.put("error", e.getMessage());
+            return ResponseEntity.status(500).body(live);
+        }
+    }
+
+    /**
+     * 详细健康检查
+     */
+    @ApiOperation("详细健康检查")
+    @GetMapping("/detailed")
+    public ResponseEntity<Map<String, Object>> detailedHealth() {
+        Map<String, Object> health = new HashMap<>();
+        
+        try {
+            health.put("timestamp", System.currentTimeMillis());
+            health.put("service", "ES Migration Monitor");
+            
+            // 应用信息
+            health.put("application", getApplicationInfo());
+            
+            // JVM信息
+            health.put("jvm", getJvmInfo());
+            
+            // 系统信息
+            health.put("system", getSystemInfo());
+            
+            // ES连接详情
+            health.put("elasticsearch", getElasticsearchDetails());
+            
+            // 任务管理详情
+            health.put("taskManager", getTaskManagerDetails());
+            
+            health.put("status", "UP");
+            return ResponseEntity.ok(health);
+            
+        } catch (Exception e) {
+            health.put("status", "ERROR");
+            health.put("error", e.getMessage());
+            return ResponseEntity.status(500).body(health);
+        }
+    }
+
+    // ==================== 私有检查方法 ====================
+
+    private Map<String, Object> checkApplicationHealth() {
+        Map<String, Object> app = new HashMap<>();
+        app.put("status", "UP");
+        app.put("uptime", ManagementFactory.getRuntimeMXBean().getUptime());
+        return app;
+    }
+
+    private Map<String, Object> checkElasticsearchHealth() {
+        Map<String, Object> es = new HashMap<>();
+        
+        try {
+            // 检查源ES连接
+            boolean sourceConnected = sourceClient.ping(RequestOptions.DEFAULT);
+            es.put("sourceConnection", sourceConnected ? "UP" : "DOWN");
+            
+            // 检查目标ES连接
+            boolean targetConnected = targetClient.ping(RequestOptions.DEFAULT);
+            es.put("targetConnection", targetConnected ? "UP" : "DOWN");
+            
+            if (sourceConnected && targetConnected) {
+                es.put("status", "UP");
+            } else {
+                es.put("status", "DOWN");
+            }
+            
+        } catch (Exception e) {
+            es.put("status", "DOWN");
+            es.put("error", e.getMessage());
+        }
+        
+        return es;
+    }
+
+    private Map<String, Object> checkTaskManagerHealth() {
+        Map<String, Object> tasks = new HashMap<>();
+        
+        try {
+            int totalTasks = taskManager.getAllTasks().size();
+            int runningTasks = taskManager.getRunningTasks().size();
+            
+            tasks.put("totalTasks", totalTasks);
+            tasks.put("runningTasks", runningTasks);
+            
+            // 检查任务队列是否过载
+            if (runningTasks > 50) {
+                tasks.put("status", "WARNING");
+                tasks.put("message", "任务队列过载");
+            } else {
+                tasks.put("status", "UP");
+            }
+            
+        } catch (Exception e) {
+            tasks.put("status", "DOWN");
+            tasks.put("error", e.getMessage());
+        }
+        
+        return tasks;
+    }
+
+    private Map<String, Object> checkSystemHealth() {
+        Map<String, Object> system = new HashMap<>();
+        
+        try {
+            MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
+            long heapUsed = memoryBean.getHeapMemoryUsage().getUsed();
+            long heapMax = memoryBean.getHeapMemoryUsage().getMax();
+            double heapUsagePercent = (double) heapUsed / heapMax * 100;
+            
+            system.put("heapUsagePercent", String.format("%.2f%%", heapUsagePercent));
+            
+            // 内存使用率检查
+            if (heapUsagePercent > 85) {
+                system.put("status", "WARNING");
+                system.put("message", "内存使用率过高");
+            } else {
+                system.put("status", "UP");
+            }
+            
+        } catch (Exception e) {
+            system.put("status", "WARNING");
+            system.put("error", e.getMessage());
+        }
+        
+        return system;
+    }
+
+    private boolean isElasticsearchConnected() {
+        try {
+            return sourceClient.ping(RequestOptions.DEFAULT) &&
+                   targetClient.ping(RequestOptions.DEFAULT);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // ==================== 详细信息方法 ====================
+
+    private Map<String, Object> getApplicationInfo() {
+        Map<String, Object> app = new HashMap<>();
+        RuntimeMXBean runtimeBean = ManagementFactory.getRuntimeMXBean();
+        
+        app.put("name", "ES Migration Monitor");
+        app.put("version", "1.0.0");
+        app.put("startTime", runtimeBean.getStartTime());
+        app.put("uptime", runtimeBean.getUptime());
+        app.put("jvmName", runtimeBean.getVmName());
+        app.put("jvmVersion", runtimeBean.getVmVersion());
+        
+        return app;
+    }
+
+    private Map<String, Object> getJvmInfo() {
+        Map<String, Object> jvm = new HashMap<>();
+        MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
+        
+        // 堆内存信息
+        Map<String, Object> heap = new HashMap<>();
+        heap.put("used", memoryBean.getHeapMemoryUsage().getUsed());
+        heap.put("max", memoryBean.getHeapMemoryUsage().getMax());
+        heap.put("committed", memoryBean.getHeapMemoryUsage().getCommitted());
+        jvm.put("heap", heap);
+        
+        // 非堆内存信息
+        Map<String, Object> nonHeap = new HashMap<>();
+        nonHeap.put("used", memoryBean.getNonHeapMemoryUsage().getUsed());
+        nonHeap.put("max", memoryBean.getNonHeapMemoryUsage().getMax());
+        nonHeap.put("committed", memoryBean.getNonHeapMemoryUsage().getCommitted());
+        jvm.put("nonHeap", nonHeap);
+        
+        return jvm;
+    }
+
+    private Map<String, Object> getSystemInfo() {
+        Map<String, Object> system = new HashMap<>();
+        OperatingSystemMXBean osBean = ManagementFactory.getOperatingSystemMXBean();
+        
+        system.put("osName", osBean.getName());
+        system.put("osVersion", osBean.getVersion());
+        system.put("osArch", osBean.getArch());
+        system.put("availableProcessors", osBean.getAvailableProcessors());
+        
+        return system;
+    }
+
+    private Map<String, Object> getElasticsearchDetails() {
+        Map<String, Object> es = new HashMap<>();
+        
+        try {
+            // 源ES连接状态
+            boolean sourceConnected = sourceClient.ping(RequestOptions.DEFAULT);
+            es.put("sourceConnection", sourceConnected ? "CONNECTED" : "DISCONNECTED");
+            
+            // 目标ES连接状态  
+            boolean targetConnected = targetClient.ping(RequestOptions.DEFAULT);
+            es.put("targetConnection", targetConnected ? "CONNECTED" : "DISCONNECTED");
+            
+            es.put("status", (sourceConnected && targetConnected) ? "HEALTHY" : "UNHEALTHY");
+            
+        } catch (Exception e) {
+            es.put("status", "ERROR");
+            es.put("error", e.getMessage());
+        }
+        
+        return es;
+    }
+
+    private Map<String, Object> getTaskManagerDetails() {
+        Map<String, Object> tasks = new HashMap<>();
+        
+        try {
+            tasks.put("totalTasks", taskManager.getAllTasks().size());
+            tasks.put("runningTasks", taskManager.getRunningTasks().size());
+            tasks.put("status", "OPERATIONAL");
+            
+        } catch (Exception e) {
+            tasks.put("status", "ERROR");
+            tasks.put("error", e.getMessage());
+        }
+        
+        return tasks;
     }
 }
