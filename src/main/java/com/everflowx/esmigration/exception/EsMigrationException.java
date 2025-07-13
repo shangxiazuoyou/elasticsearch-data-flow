@@ -35,6 +35,11 @@ public class EsMigrationException extends RuntimeException {
         this.indexName = indexName;
     }
     
+    public EsMigrationException(String errorCode, String message, Throwable cause) {
+        super(message, cause);
+        this.errorCode = errorCode;
+    }
+    
     public String getErrorCode() {
         return errorCode;
     }

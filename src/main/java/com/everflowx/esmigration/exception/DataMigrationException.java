@@ -88,4 +88,11 @@ public class DataMigrationException extends EsMigrationException {
             indexName, cause
         );
     }
+    
+    public static DataMigrationException bulkOperationFailed(String indexName, String batchId, int failedCount, Throwable cause) {
+        return new DataMigrationException(
+            String.format("批量操作失败，失败数量: %d", failedCount),
+            indexName, batchId, cause
+        );
+    }
 }

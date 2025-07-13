@@ -1,6 +1,7 @@
 package com.everflowx.esmigration.controller;
 
 import com.everflowx.esmigration.config.ElasticsearchConfig;
+import com.everflowx.esmigration.exception.GlobalExceptionHandler;
 import com.everflowx.esmigration.service.EsMigrationService;
 import com.everflowx.esmigration.service.IndexSyncService;
 import io.swagger.annotations.Api;
@@ -46,6 +47,9 @@ public class HealthController {
     
     @Autowired
     private IndexSyncService indexSyncService;
+    
+    @Autowired
+    private GlobalExceptionHandler globalExceptionHandler;
     
     @ApiOperation("系统健康检查")
     @GetMapping("/check")
@@ -258,6 +262,38 @@ public class HealthController {
         system.put("osVersion", System.getProperty("os.version"));
         system.put("javaVersion", System.getProperty("java.version"));
         result.put("system", system);
+        
+        return result;
+    }
+    
+    @ApiOperation("异常统计信息")
+    @GetMapping("/exceptions")
+    public Map<String, Object> getExceptionStats() {
+        Map<String, Object> result = new HashMap<>();
+        
+        try {
+            Map<String, Object> stats = globalExceptionHandler.getExceptionStats();
+            result.put("success", true);
+            result.put("exceptionStats", stats);
+            result.put("timestamp", System.currentTimeMillis());
+            
+            // 计算异常比率
+            long total = (Long) stats.get("totalExceptions");
+            if (total > 0) {
+                Map<String, String> rates = new HashMap<>();
+                rates.put("businessRate", String.format("%.1f%%", (Long) stats.get("businessExceptions") * 100.0 / total));
+                rates.put("systemRate", String.format("%.1f%%", (Long) stats.get("systemExceptions") * 100.0 / total));
+                rates.put("networkRate", String.format("%.1f%%", (Long) stats.get("networkExceptions") * 100.0 / total));
+                rates.put("validationRate", String.format("%.1f%%", (Long) stats.get("validationExceptions") * 100.0 / total));
+                result.put("exceptionRates", rates);
+            }
+            
+        } catch (Exception e) {
+            log.error("获取异常统计信息失败", e);
+            result.put("success", false);
+            result.put("message", "获取异常统计信息失败: " + e.getMessage());
+            result.put("timestamp", System.currentTimeMillis());
+        }
         
         return result;
     }

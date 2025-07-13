@@ -16,6 +16,16 @@ public class MigrationConfigException extends EsMigrationException {
               String.format("配置错误 [%s]: %s", fieldName, message));
     }
     
+    // 私有构造函数用于内部创建，避免公共API混乱
+    private MigrationConfigException(String errorCode, String message, Throwable cause) {
+        super(errorCode, message, cause);
+    }
+    
+    // 静态工厂方法为ExceptionHandler提供清晰的API
+    public static MigrationConfigException withCustomErrorCode(String errorCode, String message) {
+        return new MigrationConfigException(errorCode, message, null);
+    }
+    
     public static MigrationConfigException invalidBatchSize(int batchSize) {
         return new MigrationConfigException(
             String.format("批次大小无效: %d, 必须在1-10000之间", batchSize),

@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ES数据迁移监控面板</title>
+    <link href="css/bootstrap.min.css?v=1.0" rel="stylesheet">
+    <link href="css/all.min.css?v=1.1" rel="stylesheet">
+    <!-- 强制禁用旧的字体缓存 -->
+    <style>
+        @font-face {
+            font-family: 'Font Awesome 6 Free';
+            src: url('fonts/fa-solid-900.woff2') format('woff2');
+            font-weight: 900;
+            font-display: swap;
+        }
+        @font-face {
+            font-family: 'Font Awesome 6 Free';
+            src: url('fonts/fa-regular-400.woff2') format('woff2');
+            font-weight: 400;
+            font-display: swap;
+        }
+        @font-face {
+            font-family: 'Font Awesome 6 Brands';
+            src: url('fonts/fa-brands-400.woff2') format('woff2');
+            font-weight: 400;
+            font-display: swap;
+        }
+    </style>
+    <style>
+        .progress-bar-animated {
+            animation: progress-bar-stripes 1s linear infinite;
+        }
+
+        .task-card {
+            transition: all 0.3s ease;
+            border-left: 4px solid #dee2e6;
+        }
+
+        .task-card.running {
+            border-left-color: #0d6efd;
+            box-shadow: 0 0 10px rgba(13, 110, 253, 0.3);
+        }
+
+        .task-card.completed {
+            border-left-color: #198754;
+        }
+
+        .task-card.failed {
+            border-left-color: #dc3545;
+        }
+
+        .task-card.cancelled {
+            border-left-color: #6c757d;
+        }
+
+        .stats-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .speed-indicator {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            font-weight: bold;
+        }
+
+        .speed-high {
+            background-color: #198754;
+            color: white;
+        }
+
+        .speed-medium {
+            background-color: #ffc107;
+            color: black;
+        }
+
+        .speed-low {
+            background-color: #dc3545;
+            color: white;
+        }
+
+        .real-time-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background-color: #198754;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.5;
+            }
+            100% {
+                opacity: 1;
+            }
+        }
+
+        .log-container {
+            max-height: 300px;
+            overflow-y: auto;
+            background-color: #f8f9fa;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+
+        .task-detail-modal .modal-dialog {
+            max-width: 80%;
+        }
+
+        .phase-badge {
+            font-size: 0.8em;
+            padding: 4px 8px;
+        }
+
+        .chart-container {
+            position: relative;
+            height: 200px;
+        }
+        
+        .system-stats-card {
+            transition: all 0.3s ease;
+        }
+        
+        .system-stats-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        
+        .progress-mini {
+            height: 6px;
+        }
+        
+        .active-tasks-detail {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        
+        .health-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 5px;
+        }
+        
+        .health-up {
+            background-color: #28a745;
+            animation: pulse 2s infinite;
+        }
+        
+        .health-down {
+            background-color: #dc3545;
+        }
+        
+        .health-warning {
+            background-color: #ffc107;
+        }
+        
+        .metric-value {
+            font-size: 1.2em;
+            font-weight: bold;
+        }
+        
+        .metric-label {
+            font-size: 0.9em;
+            color: #6c757d;
+        }
+        
+        .mini-chart {
+            height: 80px;
+            display: flex;
+            align-items: end;
+            justify-content: space-between;
+            padding: 5px;
+        }
+        
+        .performance-mini-chart {
+            height: 60px;
+            display: flex;
+            align-items: end;
+            justify-content: center;
+            padding: 5px;
+        }
+        
+        .chart-bar:hover .throughput-bar,
+        .chart-bar:hover .task-bar {
+            opacity: 0.8;
+        }
+        
+        .memory-donut-chart {
+            transition: transform 0.3s ease;
+        }
+        
+        .memory-donut-chart:hover {
+            transform: scale(1.05);
+        }
+        
+        .perf-bar {
+            transition: all 0.3s ease;
+        }
+        
+        .perf-bar:hover {
+            transform: translateY(-2px);
+        }
+        
+        .cpu-gauge {
+            transition: all 0.3s ease;
+        }
+        
+        .cpu-gauge:hover {
+            transform: scale(1.1);
+        }
+    </style>
+</head>
+<body>
+<nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+    <div class="container-fluid">
+        <a class="navbar-brand" href="#">
+            <i class="fas fa-tachometer-alt"></i> ES数据迁移监控面板
+        </a>
+        <div class="navbar-nav ms-auto">
+                <span class="navbar-text">
+                    <span class="real-time-indicator"></span> 实时监控
+                </span>
+        </div>
+    </div>
+</nav>
+
+<div class="container-fluid mt-4">
+    <!-- 系统统计卡片 -->
+    <div class="row mb-4">
+        <div class="col-md-2">
+            <div class="card stats-card">
+                <div class="card-body text-center">
+                    <h5 class="card-title">总任务数</h5>
+                    <h2 id="totalTasks">0</h2>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-2">
+            <div class="card text-white bg-success">
+                <div class="card-body text-center">
+                    <h5 class="card-title">运行中</h5>
+                    <h2 id="runningTasks">0</h2>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-2">
+            <div class="card text-white bg-info">
+                <div class="card-body text-center">
+                    <h5 class="card-title">已完成</h5>
+                    <h2 id="completedTasks">0</h2>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-2">
+            <div class="card text-white bg-danger">
+                <div class="card-body text-center">
+                    <h5 class="card-title">失败</h5>
+                    <h2 id="failedTasks">0</h2>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-2">
+            <div class="card text-white bg-warning">
+                <div class="card-body text-center">
+                    <h5 class="card-title">等待中</h5>
+                    <h2 id="pendingTasks">0</h2>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-2">
+            <div class="card text-white bg-dark">
+                <div class="card-body text-center">
+                    <h5 class="card-title">总文档数</h5>
+                    <h2 id="totalDocs">0</h2>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 增强系统统计行 -->
+    <div class="row mb-4">
+        <div class="col-md-3">
+            <div class="card border-primary">
+                <div class="card-header bg-primary text-white">
+                    <h6 class="mb-0"><i class="fas fa-tachometer-alt"></i> 性能指标</h6>
+                </div>
+                <div class="card-body">
+                    <div class="row text-center">
+                        <div class="col-6">
+                            <small class="text-muted">当前速度</small><br>
+                            <strong id="currentTotalSpeed">0 文档/秒</strong>
+                        </div>
+                        <div class="col-6">
+                            <small class="text-muted">平均速度</small><br>
+                            <strong id="currentAverageSpeed">0 文档/秒</strong>
+                        </div>
+                    </div>
+                    <hr class="my-2">
+                    <div class="text-center">
+                        <small class="text-muted">预计完成时间</small><br>
+                        <span id="estimatedCompletion">计算中...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-3">
+            <div class="card border-success">
+                <div class="card-header bg-success text-white">
+                    <h6 class="mb-0"><i class="fas fa-server"></i> 系统资源</h6>
+                </div>
+                <div class="card-body">
+                    <div class="mb-2">
+                        <small class="text-muted">堆内存使用</small>
+                        <div class="d-flex justify-content-between">
+                            <span id="heapUsage">0MB / 0MB</span>
+                            <span id="heapUsagePercent">0.00%</span>
+                        </div>
+                        <div class="progress mt-1" style="height: 6px;" id="heapUsageBar">
+                            <div class="progress-bar bg-success" style="width: 0%"></div>
+                        </div>
+                    </div>
+                    <div class="row text-center">
+                        <div class="col-6">
+                            <small class="text-muted">线程数</small><br>
+                            <strong id="currentThreadCount">0</strong>
+                        </div>
+                        <div class="col-6">
+                            <small class="text-muted">CPU核心</small><br>
+                            <strong id="availableProcessors">0</strong>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-3">
+            <div class="card border-info">
+                <div class="card-header bg-info text-white">
+                    <h6 class="mb-0"><i class="fas fa-chart-line"></i> 实时指标</h6>
+                </div>
+                <div class="card-body">
+                    <div class="mb-2">
+                        <small class="text-muted">系统负载</small><br>
+                        <strong id="systemLoadAverage">不支持</strong>
+                    </div>
+                    <div class="mb-2">
+                        <small class="text-muted">运行时长</small><br>
+                        <strong id="systemUptime">未知</strong>
+                    </div>
+                    <div>
+                        <small class="text-muted">服务器时间</small><br>
+                        <small id="serverTime">未知</small>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-3">
+            <div class="card border-warning">
+                <div class="card-header bg-warning text-dark">
+                    <h6 class="mb-0"><i class="fas fa-tasks"></i> 活跃任务</h6>
+                </div>
+                <div class="card-body">
+                    <div id="activeTasksContainer" style="max-height: 120px; overflow-y: auto;">
+                        <div class="text-muted">暂无活跃任务</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 图表显示区 -->
+    <div class="row mb-4">
+        <div class="col-md-3">
+            <div class="card">
+                <div class="card-header">
+                    <h6 class="mb-0"><i class="fas fa-chart-line"></i> 性能趋势</h6>
+                </div>
+                <div class="card-body text-center">
+                    <div id="performanceChart" style="height: 80px; border: 1px dashed #ccc; min-height: 80px;">
+                        <!-- 性能图表将在这里显示 -->
+                    </div>
+                    <small class="text-muted">最近性能趋势</small>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-3">
+            <div class="card">
+                <div class="card-header">
+                    <h6 class="mb-0"><i class="fas fa-memory"></i> 内存使用</h6>
+                </div>
+                <div class="card-body text-center">
+                    <div id="memoryChart" style="height: 120px; border: 1px dashed #ccc; min-height: 120px;">
+                        <!-- 内存图表将在这里显示 -->
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-3">
+            <div class="card">
+                <div class="card-header">
+                    <h6 class="mb-0"><i class="fas fa-microchip"></i> CPU使用</h6>
+                </div>
+                <div class="card-body text-center">
+                    <div id="cpuChart" style="height: 80px;">
+                        <!-- CPU图表将在这里显示 -->
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="col-md-3">
+            <div class="card">
+                <div class="card-header">
+                    <h6 class="mb-0"><i class="fas fa-chart-area"></i> 历史趋势</h6>
+                </div>
+                <div class="card-body text-center">
+                    <div id="trendChart" style="height: 100px;">
+                        <!-- 趋势图表将在这里显示 -->
+                    </div>
+                    <small class="text-muted">24小时趋势</small>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 操作按钮 -->
+    <div class="row mb-3">
+        <div class="col-12">
+            <button class="btn btn-primary me-2" onclick="refreshTasks()">
+                <i class="fas fa-sync-alt"></i> 刷新
+            </button>
+            <button class="btn btn-success me-2" onclick="showCreateTaskModal()">
+                <i class="fas fa-plus"></i> 创建任务
+            </button>
+            <button class="btn btn-info me-2" onclick="showSystemStatsModal()">
+                <i class="fas fa-chart-bar"></i> 系统统计详情
+            </button>
+            <span class="badge bg-secondary me-2">
+                <span class="health-indicator health-up" id="healthIndicator"></span>
+                系统状态: <span id="systemStatus">运行中</span>
+            </span>
+            <div class="form-check form-switch d-inline-block ms-3">
+                <input class="form-check-input" type="checkbox" id="autoRefresh" checked>
+                <label class="form-check-label" for="autoRefresh">自动刷新</label>
+            </div>
+        </div>
+    </div>
+
+    <!-- 任务列表 -->
+    <div class="row">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">任务列表</h5>
+                </div>
+                <div class="card-body">
+                    <div id="tasksList" class="row">
+                        <!-- 任务卡片将在这里动态生成 -->
+                    </div>
+                    <div id="noTasks" class="text-center text-muted" style="display: none;">
+                        <i class="fas fa-tasks fa-3x mb-3"></i>
+                        <p>暂无任务</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 实时日志 -->
+    <div class="row mt-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0">实时日志</h5>
+                    <button class="btn btn-sm btn-outline-secondary" onclick="clearLogs()">
+                        <i class="fas fa-trash"></i> 清空
+                    </button>
+                </div>
+                <div class="card-body">
+                    <div id="realTimeLogs" class="log-container">
+                        <!-- 日志将在这里显示 -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 系统统计详情模态框 -->
+<div class="modal fade" id="systemStatsModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">
+                    <i class="fas fa-chart-bar"></i> 系统统计详情
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h6 class="mb-0">详细系统统计信息</h6>
+                    <button class="btn btn-sm btn-outline-primary" onclick="loadDetailedSystemStats()">
+                        <i class="fas fa-sync-alt"></i> 刷新数据
+                    </button>
+                </div>
+                <div id="systemStatsModalContent">
+                    <div class="text-center">
+                        <div class="spinner-border text-primary" role="status">
+                            <span class="visually-hidden">加载中...</span>
+                        </div>
+                        <p class="mt-2">正在加载系统统计数据...</p>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                <button type="button" class="btn btn-primary" onclick="loadDetailedSystemStats()">
+                    <i class="fas fa-download"></i> 导出报告
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 任务详情模态框 -->
+<div class="modal fade task-detail-modal" id="taskDetailModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">任务详情</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="taskDetailContent">
+                <!-- 任务详情内容 -->
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 创建任务模态框 -->
+<div class="modal fade" id="createTaskModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">创建新任务</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="createTaskForm">
+                    <div class="mb-3">
+                        <label class="form-label">任务类型</label>
+                        <select class="form-select" id="taskType" onchange="toggleConfigFields()">
+                            <option value="FULL_MIGRATION">全量迁移</option>
+                            <option value="INCREMENTAL_MIGRATION">增量迁移</option>
+                            <option value="INDEX_SYNC">索引同步</option>
+                        </select>
+                    </div>
+
+                    <div id="migrationFields">
+                        <div class="mb-3">
+                            <label class="form-label">源索引</label>
+                            <input type="text" class="form-control" id="sourceIndex" placeholder="source_index">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">目标索引</label>
+                            <input type="text" class="form-control" id="targetIndex" placeholder="target_index">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">批次大小</label>
+                            <input type="number" class="form-control" id="batchSize" value="1000">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">线程数</label>
+                            <input type="number" class="form-control" id="threadCount" value="2">
+                        </div>
+                    </div>
+
+                    <div id="syncFields" style="display: none;">
+                        <div class="mb-3">
+                            <label class="form-label">索引名称（逗号分隔，留空表示所有索引）</label>
+                            <input type="text" class="form-control" id="indexNames" placeholder="index1,index2,index3">
+                        </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="syncData" checked>
+                            <label class="form-check-label">同步数据</label>
+                        </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="syncMappings" checked>
+                            <label class="form-check-label">同步映射</label>
+                        </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="syncSettings" checked>
+                            <label class="form-check-label">同步设置</label>
+                        </div>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                <button type="button" class="btn btn-primary" onclick="createTask()">创建任务</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="js/bootstrap.bundle.min.js"></script>
+<script src="js/sockjs.min.js"></script>
+<script src="js/stomp.min.js"></script>
+<script src="monitor.js"></script>
+</body>
+</html>

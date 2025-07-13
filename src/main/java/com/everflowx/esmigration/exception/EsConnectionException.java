@@ -25,6 +25,14 @@ public class EsConnectionException extends EsMigrationException {
         this.isTarget = isTarget;
     }
     
+    // 为ExceptionHandler提供的构造函数
+    public EsConnectionException(String errorCode, String message, Throwable cause) {
+        super(errorCode, message, cause);
+        this.esHost = "unknown";
+        this.esPort = 0;
+        this.isTarget = false;
+    }
+    
     public String getEsHost() {
         return esHost;
     }
