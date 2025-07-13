@@ -1,0 +1,55 @@
+application:
+  version: V0.0.1
+server:
+  port: 6618
+spring:
+  application:
+    name: elasticsearch-data-flow
+
+knife4j:
+  enable: true
+
+# Elasticsearch配置
+elasticsearch:
+  # 源ES配置
+  source:
+    host: localhost
+    port: 9200
+    scheme: http
+    username: elastic
+    password: xxx
+  # 目标ES配置
+  target:
+    host: localhost
+    port: 9200
+    scheme: http
+    username: elastic
+    password: xxx
+  # 响应缓冲区配置
+  response:
+    buffer:
+      # 响应缓冲区最大限制（字节），调整为500MB以支持大数据量迁移
+      limit: 524288000  # 500MB
+      # 初始缓冲区大小（字节），默认1MB
+      initial: 1048576  # 1MB
+
+# ES迁移任务配置
+es:
+  migration:
+    task:
+      # 是否启用定时任务
+      enabled: false
+      # 源索引名称
+      source-index: doc-develop
+      # 目标索引名称
+      target-index: doc-develop2
+      # 批次大小
+      batch-size: 1000
+      # 时间戳字段名
+      timestamp-field: createTime
+      # 忽略大小写的字段（逗号分隔）
+      case-insensitive-fields: subject
+      # 新增字段（格式：字段名=默认值，逗号分隔）
+      new-fields: migration_time=now,migration_version=1.0
+      # 字段映射（格式：源字段=目标字段，逗号分隔）
+      field-mapping:
