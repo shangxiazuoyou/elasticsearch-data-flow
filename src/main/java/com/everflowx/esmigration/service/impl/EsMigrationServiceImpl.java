@@ -216,7 +216,7 @@ public class EsMigrationServiceImpl implements EsMigrationService {
     /**
      * 执行单线程迁移 - 增加内存管理和动态调整
      */
-    private void executeSingleThreadMigration(MigrationConfig config, MigrationResult result) throws IOException {
+    private void executeSingleThreadMigration(MigrationConfig config, MigrationResult result, String taskId) throws IOException {
         SearchRequest searchRequest = new SearchRequest(config.getSourceIndex());
         SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
         searchSourceBuilder.query(QueryBuilders.matchAllQuery());
@@ -250,7 +250,7 @@ public class EsMigrationServiceImpl implements EsMigrationService {
             }
             
             try {
-                processBatch(searchHits, config, result);
+                processBatch(searchHits, config, result, taskId);
                 consecutiveErrors = 0; // 成功处理，重置错误计数
                 
                 // 计算处理速度并更新监控
@@ -392,7 +392,7 @@ public class EsMigrationServiceImpl implements EsMigrationService {
     /**
      * 处理批次数据 - 修复错误计数逻辑
      */
-    private void processBatch(SearchHit[] hits, MigrationConfig config, MigrationResult result) {
+    private void processBatch(SearchHit[] hits, MigrationConfig config, MigrationResult result, String taskId) {
         BulkRequest bulkRequest = new BulkRequest();
         AtomicLong batchPreprocessFailed = new AtomicLong(0);
         
@@ -618,7 +618,7 @@ public class EsMigrationServiceImpl implements EsMigrationService {
         result.setTotalCount(searchResponse.getHits().getTotalHits().value);
 
         while (searchHits != null && searchHits.length > 0) {
-            processBatch(searchHits, config, result);
+            processBatch(searchHits, config, result, "incremental_" + System.currentTimeMillis());
 
             SearchScrollRequest scrollRequest = new SearchScrollRequest(scrollId);
             scrollRequest.scroll(TimeValue.timeValueMinutes(config.getScrollTimeout()));
@@ -1018,7 +1018,7 @@ public class EsMigrationServiceImpl implements EsMigrationService {
         
         try {
             log.info("开始单线程迁移，任务ID: {}", taskId);
-            executeSingleThreadMigration(config, result);
+            executeSingleThreadMigration(config, result, taskId);
             
             // 更新最终状态
             checkpoint.setProcessedCount(result.getSuccessCount() + result.getFailedCount());

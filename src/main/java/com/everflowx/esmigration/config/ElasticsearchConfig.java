@@ -5,6 +5,12 @@ import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.UsernamePasswordCredentials;
 import org.apache.http.client.CredentialsProvider;
 import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.impl.nio.reactor.IOReactorConfig;
+import org.apache.http.impl.nio.conn.PoolingNHttpClientConnectionManager;
+import org.apache.http.nio.reactor.ConnectingIOReactor;
+import org.apache.http.nio.reactor.IOReactor;
+import org.apache.http.nio.reactor.IOReactorException;
+import org.apache.http.impl.nio.reactor.DefaultConnectingIOReactor;
 import org.elasticsearch.client.RestClient;
 import org.elasticsearch.client.RestClientBuilder;
 import org.elasticsearch.client.RestHighLevelClient;
@@ -15,7 +21,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 import lombok.extern.slf4j.Slf4j;
-import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Elasticsearch配置类
@@ -31,32 +37,32 @@ public class ElasticsearchConfig {
     // 源ES配置
     @Value("${elasticsearch.source.host:localhost}")
     private String sourceHost;
-    
+
     @Value("${elasticsearch.source.port:9200}")
     private int sourcePort;
-    
+
     @Value("${elasticsearch.source.scheme:http}")
     private String sourceScheme;
-    
+
     @Value("${elasticsearch.source.username:}")
     private String sourceUsername;
-    
+
     @Value("${elasticsearch.source.password:}")
     private String sourcePassword;
-    
+
     // 目标ES配置
     @Value("${elasticsearch.target.host:localhost}")
     private String targetHost;
-    
+
     @Value("${elasticsearch.target.port:9200}")
     private int targetPort;
-    
+
     @Value("${elasticsearch.target.scheme:http}")
     private String targetScheme;
-    
+
     @Value("${elasticsearch.target.username:}")
     private String targetUsername;
-    
+
     @Value("${elasticsearch.target.password:}")
     private String targetPassword;
 
@@ -66,24 +72,24 @@ public class ElasticsearchConfig {
 
     @Value("${elasticsearch.response.buffer.initial:10485760}") // 默认10MB
     private int responseBufferInitial;
-    
+
     // 连接池配置
     @Value("${elasticsearch.connection.max-total:200}") // 最大连接数
     private int maxConnectionTotal;
-    
+
     @Value("${elasticsearch.connection.max-per-route:100}") // 每个路由最大连接数
     private int maxConnectionPerRoute;
-    
+
     // 超时配置
     @Value("${elasticsearch.timeout.connect:30000}") // 连接超时，默认30秒
     private int connectTimeout;
-    
+
     @Value("${elasticsearch.timeout.socket:600000}") // Socket超时，默认10分钟
     private int socketTimeout;
-    
+
     @Value("${elasticsearch.timeout.connection-request:60000}") // 连接请求超时，默认1分钟
     private int connectionRequestTimeout;
-    
+
     // 线程池配置
     @Value("${elasticsearch.io.thread-count:0}") // IO线程数，0表示使用CPU核数
     private int ioThreadCount;
@@ -116,39 +122,36 @@ public class ElasticsearchConfig {
             // 设置连接池大小 - 增加并发处理能力
             httpClientBuilder.setMaxConnTotal(maxConnectionTotal);
             httpClientBuilder.setMaxConnPerRoute(maxConnectionPerRoute);
-            
-            // 设置连接生存时间，避免频繁建连
-            httpClientBuilder.setConnectionTimeToLive(5, java.util.concurrent.TimeUnit.MINUTES);
+
+            // 设置连接管理策略
+            // 注意：setConnectionTimeToLive 在某些版本中不可用，这里移除
 
             // 配置IO反应器 - 优化大数据量处理
             int actualIoThreadCount = ioThreadCount > 0 ? ioThreadCount : Runtime.getRuntime().availableProcessors();
-            httpClientBuilder.setDefaultIOReactorConfig(
-                org.apache.http.impl.nio.reactor.IOReactorConfig.custom()
-                    .setIoThreadCount(actualIoThreadCount)
-                    .setSoKeepAlive(true)
-                    .setTcpNoDelay(true) // 禁用Nagle算法，减少延迟
-                    .setSoTimeout(socketTimeout)
-                    .setConnectTimeout(connectTimeout)
-                    .setSoReuseAddress(true) // 允许地址重用
-                    .build()
-            );
-            
-            // 设置连接管理器 - 优化连接复用
-            httpClientBuilder.setConnectionManager(
-                new org.apache.http.impl.nio.conn.PoolingNHttpClientConnectionManager(
-                    org.apache.http.nio.reactor.IOReactorUtils.create(
-                        org.apache.http.impl.nio.reactor.IOReactorConfig.custom()
-                            .setIoThreadCount(actualIoThreadCount)
-                            .setSoKeepAlive(true)
-                            .setTcpNoDelay(true)
-                            .build()
-                    )
-                ) {{
-                    setMaxTotal(maxConnectionTotal);
-                    setDefaultMaxPerRoute(maxConnectionPerRoute);
-                    setValidateAfterInactivity(30000); // 30秒后验证连接
-                }}
-            );
+
+            IOReactorConfig ioConfig = IOReactorConfig.custom()
+                .setIoThreadCount(actualIoThreadCount)
+                .setSoKeepAlive(true)
+                .setTcpNoDelay(true) // 禁用Nagle算法，减少延迟
+                .setSoTimeout(socketTimeout)
+                .setConnectTimeout(connectTimeout)
+                .setSoReuseAddress(true) // 允许地址重用
+                .build();
+
+            httpClientBuilder.setDefaultIOReactorConfig(ioConfig);
+
+            // 创建连接管理器 - 优化连接复用
+            try {
+                ConnectingIOReactor ioReactor = new DefaultConnectingIOReactor(ioConfig);
+                PoolingNHttpClientConnectionManager connectionManager = new PoolingNHttpClientConnectionManager(ioReactor);
+                connectionManager.setMaxTotal(maxConnectionTotal);
+                connectionManager.setDefaultMaxPerRoute(maxConnectionPerRoute);
+                // connectionManager.setValidateAfterInactivity(30000); // 方法不存在，已注释
+                httpClientBuilder.setConnectionManager(connectionManager);
+            } catch (IOReactorException e) {
+                log.error("创建IO反应器失败", e);
+                // 如果创建失败，使用默认配置
+            }
 
             // 如果配置了用户名密码，则添加认证
             if (username != null && !username.isEmpty() && password != null && !password.isEmpty()) {
@@ -174,7 +177,7 @@ public class ElasticsearchConfig {
         log.info("创建ES客户端 - Host: {}:{}, 响应缓冲区限制: {}MB, 初始缓冲区: {}MB, " +
                 "连接池: {}/{}, IO线程: {}, 超时: {}/{}ms",
                 host, port, responseBufferLimit / 1024 / 1024, responseBufferInitial / 1024 / 1024,
-                maxConnectionTotal, maxConnectionPerRoute, 
+                maxConnectionTotal, maxConnectionPerRoute,
                 ioThreadCount > 0 ? ioThreadCount : Runtime.getRuntime().availableProcessors(),
                 connectTimeout, socketTimeout);
 
@@ -260,21 +263,21 @@ public class ElasticsearchConfig {
             return RequestOptions.DEFAULT;
         }
     }
-    
+
     /**
      * 获取连接池配置信息
      */
     public String getConnectionPoolInfo() {
-        return String.format("连接池配置: 总连接数=%d, 每路由连接数=%d, IO线程数=%d", 
-            maxConnectionTotal, maxConnectionPerRoute, 
+        return String.format("连接池配置: 总连接数=%d, 每路由连接数=%d, IO线程数=%d",
+            maxConnectionTotal, maxConnectionPerRoute,
             ioThreadCount > 0 ? ioThreadCount : Runtime.getRuntime().availableProcessors());
     }
-    
+
     /**
      * 获取超时配置信息
      */
     public String getTimeoutInfo() {
-        return String.format("超时配置: 连接超时=%ds, Socket超时=%ds, 连接请求超时=%ds", 
+        return String.format("超时配置: 连接超时=%ds, Socket超时=%ds, 连接请求超时=%ds",
             connectTimeout / 1000, socketTimeout / 1000, connectionRequestTimeout / 1000);
     }
 }
