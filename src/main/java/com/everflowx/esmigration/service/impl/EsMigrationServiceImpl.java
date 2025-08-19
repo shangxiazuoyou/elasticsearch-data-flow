@@ -32,12 +32,17 @@ import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
 import java.io.IOException;
+import com.everflowx.esmigration.service.CheckpointService;
+import com.everflowx.esmigration.domain.MigrationCheckpoint;
+import com.everflowx.esmigration.monitor.MigrationMonitor;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * ES数据迁移服务实现类
@@ -62,16 +67,39 @@ public class EsMigrationServiceImpl implements EsMigrationService {
     @Resource
     private EsQueryHelper esQueryHelper;
     
+    @Resource
+    private CheckpointService checkpointService;
+    
+    @Resource
+    private MigrationMonitor migrationMonitor;
+    
     private static final String SCROLL_ID_TIMEOUT = "5m";
     private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
     
     @Override
     public MigrationResult fullMigration(MigrationConfig config) {
-        log.info("开始全量数据迁移，源索引: {}, 目标索引: {}, 响应缓冲区: {}MB",
-                config.getSourceIndex(), config.getTargetIndex(),
+        String taskId = generateTaskId(config);
+        log.info("开始全量数据迁移，任务ID: {}, 源索引: {}, 目标索引: {}, 响应缓冲区: {}MB",
+                taskId, config.getSourceIndex(), config.getTargetIndex(),
                 elasticsearchConfig.getResponseBufferLimit() / 1024 / 1024);
+        log.info("{}", elasticsearchConfig.getConnectionPoolInfo());
+        log.info("{}", elasticsearchConfig.getTimeoutInfo());
         
         MigrationResult result = new MigrationResult();
+        
+        // 检查是否可以从断点恢复
+        Optional<MigrationCheckpoint> checkpointOpt = Optional.empty();
+        if (checkpointService.canResumeFromCheckpoint(taskId, config)) {
+            checkpointOpt = checkpointService.getCheckpoint(taskId);
+            if (checkpointOpt.isPresent()) {
+                MigrationCheckpoint checkpoint = checkpointOpt.get();
+                log.info("检测到可恢复的断点，已处理: {}, 成功: {}, 失败: {}", 
+                    checkpoint.getProcessedCount(), checkpoint.getSuccessCount(), checkpoint.getFailedCount());
+                
+                result.setSuccessCount(checkpoint.getSuccessCount());
+                result.setFailedCount(checkpoint.getFailedCount());
+            }
+        }
         
         try {
             // 检查源索引是否存在
@@ -97,11 +125,14 @@ public class EsMigrationServiceImpl implements EsMigrationService {
             result.setTotalCount(totalCount);
             log.info("源索引文档总数: {}", totalCount);
             
+            // 开始监控任务
+            migrationMonitor.startTask(taskId, config.getSourceIndex(), config.getTargetIndex(), totalCount);
+            
             // 执行迁移
             if (config.getThreadCount() > 1) {
-                executeParallelMigration(config, result);
+                executeParallelMigrationWithCheckpoint(config, result, taskId, checkpointOpt);
             } else {
-                executeSingleThreadMigration(config, result);
+                executeSingleThreadMigrationWithCheckpoint(config, result, taskId, checkpointOpt);
             }
             
         } catch (Exception e) {
@@ -110,8 +141,33 @@ public class EsMigrationServiceImpl implements EsMigrationService {
         }
         
         result.finish();
-        log.info("全量迁移完成，总数: {}, 成功: {}, 失败: {}, 跳过: {}, 耗时: {}ms", 
-                result.getTotalCount(), result.getSuccessCount(), 
+        
+        // 清理断点信息
+        if (result.getErrorMessage() == null) {
+            checkpointService.removeCheckpoint(taskId);
+            log.info("迁移成功完成，清理断点信息");
+        } else {
+            // 保存失败状态
+            MigrationCheckpoint failedCheckpoint = new MigrationCheckpoint();
+            failedCheckpoint.setTaskId(taskId);
+            failedCheckpoint.setSourceIndex(config.getSourceIndex());
+            failedCheckpoint.setTargetIndex(config.getTargetIndex());
+            failedCheckpoint.setStatus("FAILED");
+            failedCheckpoint.setErrorMessage(result.getErrorMessage());
+            failedCheckpoint.setSuccessCount(result.getSuccessCount());
+            failedCheckpoint.setFailedCount(result.getFailedCount());
+            failedCheckpoint.setTotalCount(result.getTotalCount());
+            checkpointService.saveCheckpoint(failedCheckpoint);
+        }
+        
+        // 完成任务监控
+        String finalStatus = result.getErrorMessage() == null ? "COMPLETED" : "FAILED";
+        migrationMonitor.completeTask(taskId, finalStatus);
+        migrationMonitor.logDetailedMetrics(taskId);
+        migrationMonitor.logSystemMetrics();
+        
+        log.info("全量迁移完成，任务ID: {}, 总数: {}, 成功: {}, 失败: {}, 跳过: {}, 耗时: {}ms", 
+                taskId, result.getTotalCount(), result.getSuccessCount(), 
                 result.getFailedCount(), result.getSkippedCount(), result.getDurationMs());
         
         return result;
@@ -158,27 +214,78 @@ public class EsMigrationServiceImpl implements EsMigrationService {
     }
     
     /**
-     * 执行单线程迁移
+     * 执行单线程迁移 - 增加内存管理和动态调整
      */
     private void executeSingleThreadMigration(MigrationConfig config, MigrationResult result) throws IOException {
         SearchRequest searchRequest = new SearchRequest(config.getSourceIndex());
         SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
         searchSourceBuilder.query(QueryBuilders.matchAllQuery());
-        searchSourceBuilder.size(config.getBatchSize());
-        // 确保能获取准确的文档总数
+        
+        // 动态批次大小管理
+        int currentBatchSize = config.getBatchSize();
+        searchSourceBuilder.size(currentBatchSize);
         searchSourceBuilder.trackTotalHits(true);
         searchRequest.source(searchSourceBuilder);
         searchRequest.scroll(TimeValue.timeValueMinutes(config.getScrollTimeout()));
 
-        // 使用查询辅助工具执行带重试机制的搜索
-        log.info("开始执行全量迁移搜索，{}", esQueryHelper.getBufferConfigInfo());
+        log.info("开始执行单线程全量迁移，初始批次大小: {}, {}", currentBatchSize, esQueryHelper.getBufferConfigInfo());
         SearchResponse searchResponse = esQueryHelper.searchWithRetry(sourceClient, searchRequest, true, 3);
         String scrollId = searchResponse.getScrollId();
 
         SearchHit[] searchHits = searchResponse.getHits().getHits();
+        long totalProcessed = 0;
+        long startTime = System.currentTimeMillis();
+        long lastGcTime = getGcTime();
+        int consecutiveErrors = 0;
 
         while (searchHits != null && searchHits.length > 0) {
-            processBatch(searchHits, config, result);
+            long batchStartTime = System.currentTimeMillis();
+            long beforeBatchSuccess = result.getSuccessCount();
+            
+            // 检查内存情况并调整批次大小
+            int newBatchSize = adjustBatchSizeBasedOnMemory(currentBatchSize, totalProcessed, result.getTotalCount());
+            if (newBatchSize != currentBatchSize) {
+                currentBatchSize = newBatchSize;
+                log.info("动态调整批次大小: {} -> {}", config.getBatchSize(), currentBatchSize);
+            }
+            
+            try {
+                processBatch(searchHits, config, result);
+                consecutiveErrors = 0; // 成功处理，重置错误计数
+                
+                // 计算处理速度并更新监控
+                long batchTime = System.currentTimeMillis() - batchStartTime;
+                long batchSuccess = result.getSuccessCount() - beforeBatchSuccess;
+                if (batchTime > 0) {
+                    double speed = (double) batchSuccess / batchTime * 1000; // docs/sec
+                    
+                    // 更新监控数据
+                    migrationMonitor.updateProgress(taskId, totalProcessed, result.getSuccessCount(), result.getFailedCount());
+                    
+                    if (totalProcessed % (currentBatchSize * 5) == 0) {
+                        logPerformanceMetrics(totalProcessed, result, startTime, speed, currentBatchSize);
+                        migrationMonitor.logDetailedMetrics(taskId);
+                    }
+                }
+                
+            } catch (Exception e) {
+                consecutiveErrors++;
+                log.error("批次处理失败 ({} 次连续错误): {}", consecutiveErrors, e.getMessage());
+                
+                if (consecutiveErrors >= 3) {
+                    log.error("连续错误过多，降低批次大小并继续");
+                    currentBatchSize = Math.max(currentBatchSize / 2, 10);
+                    consecutiveErrors = 0;
+                }
+            }
+            
+            totalProcessed += searchHits.length;
+            
+            // 内存清理
+            if (totalProcessed % (currentBatchSize * 10) == 0) {
+                performMemoryCleanup(lastGcTime);
+                lastGcTime = getGcTime();
+            }
 
             SearchScrollRequest scrollRequest = new SearchScrollRequest(scrollId);
             scrollRequest.scroll(TimeValue.timeValueMinutes(config.getScrollTimeout()));
@@ -195,10 +302,99 @@ public class EsMigrationServiceImpl implements EsMigrationService {
     }
     
     /**
-     * 处理批次数据
+     * 根据内存使用情况调整批次大小
+     */
+    private int adjustBatchSizeBasedOnMemory(int currentBatchSize, long processedCount, long totalCount) {
+        Runtime runtime = Runtime.getRuntime();
+        long totalMemory = runtime.totalMemory();
+        long freeMemory = runtime.freeMemory();
+        long usedMemory = totalMemory - freeMemory;
+        double memoryUsagePercent = (double) usedMemory / totalMemory * 100;
+        
+        // 计算进度百分比
+        double progress = totalCount > 0 ? (double) processedCount / totalCount : 0;
+        
+        int newBatchSize = currentBatchSize;
+        
+        if (memoryUsagePercent > 85) {
+            // 内存使用过高，减小批次大小
+            newBatchSize = Math.max(currentBatchSize / 2, 50);
+            log.warn("内存使用过高 {:.1f}%，减小批次大小: {} -> {}", 
+                memoryUsagePercent, currentBatchSize, newBatchSize);
+        } else if (memoryUsagePercent < 50 && progress < 0.8) {
+            // 内存充足且进度较少，可以适当增加批次大小
+            newBatchSize = Math.min(currentBatchSize * 2, 5000);
+            if (newBatchSize != currentBatchSize) {
+                log.info("内存充足 {:.1f}%，增加批次大小: {} -> {}", 
+                    memoryUsagePercent, currentBatchSize, newBatchSize);
+            }
+        }
+        
+        return newBatchSize;
+    }
+    
+    /**
+     * 获取GC时间
+     */
+    private long getGcTime() {
+        try {
+            return java.lang.management.ManagementFactory.getGarbageCollectorMXBeans()
+                .stream()
+                .mapToLong(gcBean -> gcBean.getCollectionTime())
+                .sum();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+    
+    /**
+     * 执行内存清理
+     */
+    private void performMemoryCleanup(long lastGcTime) {
+        long currentGcTime = getGcTime();
+        long gcTimeDiff = currentGcTime - lastGcTime;
+        
+        if (gcTimeDiff > 1000) { // GC时间超过1秒
+            log.warn("检测到频繁GC，GC耗时: {}ms，建议手动清理内存", gcTimeDiff);
+        }
+        
+        Runtime runtime = Runtime.getRuntime();
+        long beforeGc = runtime.freeMemory();
+        System.gc(); // 手动触发GC
+        long afterGc = runtime.freeMemory();
+        
+        if (afterGc > beforeGc) {
+            log.debug("内存清理效果: 释放 {}MB", (afterGc - beforeGc) / 1024 / 1024);
+        }
+    }
+    
+    /**
+     * 记录性能指标
+     */
+    private void logPerformanceMetrics(long processedCount, MigrationResult result, long startTime, double currentSpeed, int batchSize) {
+        long elapsedTime = System.currentTimeMillis() - startTime;
+        double avgSpeed = processedCount > 0 ? (double) processedCount / elapsedTime * 1000 : 0;
+        
+        Runtime runtime = Runtime.getRuntime();
+        long usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / 1024 / 1024;
+        long maxMemory = runtime.maxMemory() / 1024 / 1024;
+        double memoryUsage = (double) usedMemory / maxMemory * 100;
+        
+        long remaining = result.getTotalCount() - processedCount;
+        long eta = avgSpeed > 0 ? (long)(remaining / avgSpeed) : -1;
+        
+        log.info("性能指标 - 已处理: {}, 当前速度: {:.1f} docs/s, 平均速度: {:.1f} docs/s, " +
+                 "内存使用: {}MB/{} MB ({:.1f}%), 批次大小: {}, 预计剩余: {}s", 
+                 processedCount, currentSpeed, avgSpeed, usedMemory, maxMemory, memoryUsage, batchSize, 
+                 eta > 0 ? eta : "unknown");
+    }
+    
+    /**
+     * 处理批次数据 - 修复错误计数逻辑
      */
     private void processBatch(SearchHit[] hits, MigrationConfig config, MigrationResult result) {
         BulkRequest bulkRequest = new BulkRequest();
+        AtomicLong batchPreprocessFailed = new AtomicLong(0);
         
         for (SearchHit hit : hits) {
             try {
@@ -212,22 +408,60 @@ public class EsMigrationServiceImpl implements EsMigrationService {
                 bulkRequest.add(indexRequest);
                 
             } catch (Exception e) {
-                log.error("处理文档失败，ID: {}, 错误: {}", hit.getId(), e.getMessage());
-                result.setFailedCount(result.getFailedCount() + 1);
+                log.error("预处理文档失败，ID: {}, 错误: {}", hit.getId(), e.getMessage());
+                batchPreprocessFailed.incrementAndGet();
             }
         }
+        
+        // 更新预处理失败数
+        result.setFailedCount(result.getFailedCount() + batchPreprocessFailed.get());
         
         if (bulkRequest.numberOfActions() > 0) {
             try {
                 BulkResponse bulkResponse = targetClient.bulk(bulkRequest, RequestOptions.DEFAULT);
+                
+                // 修复：正确统计成功和失败数量
+                AtomicLong batchSuccessCount = new AtomicLong(0);
+                AtomicLong batchFailedCount = new AtomicLong(0);
+                
                 if (bulkResponse.hasFailures()) {
-                    log.warn("批量写入部分失败: {}", bulkResponse.buildFailureMessage());
-                    result.setFailedCount(result.getFailedCount() + bulkResponse.getItems().length);
+                    // 逐个检查每个操作的结果
+                    Arrays.stream(bulkResponse.getItems())
+                        .forEach(item -> {
+                            if (item.isFailed()) {
+                                batchFailedCount.incrementAndGet();
+                                log.debug("文档写入失败: {}, 原因: {}", item.getId(), item.getFailureMessage());
+                            } else {
+                                batchSuccessCount.incrementAndGet();
+                            }
+                        });
+                    
+                    log.warn("批量写入部分失败: 成功 {} 件，失败 {} 件", batchSuccessCount.get(), batchFailedCount.get());
                 } else {
-                    result.setSuccessCount(result.getSuccessCount() + bulkResponse.getItems().length);
+                    // 全部成功
+                    batchSuccessCount.set(bulkResponse.getItems().length);
                 }
+                
+                // 更新结果计数
+                long oldSuccessCount = result.getSuccessCount();
+                long oldFailedCount = result.getFailedCount();
+                result.setSuccessCount(result.getSuccessCount() + batchSuccessCount.get());
+                result.setFailedCount(result.getFailedCount() + batchFailedCount.get());
+                
+                // 记录详细进度并更新监控
+                if (result.getSuccessCount() % 10000 == 0 || 
+                    (batchSuccessCount.get() > 0 && result.getSuccessCount() != oldSuccessCount)) {
+                    long totalProcessed = result.getSuccessCount() + result.getFailedCount();
+                    double successRate = totalProcessed > 0 ? (double) result.getSuccessCount() / totalProcessed * 100 : 0;
+                    log.info("进度更新: 成功 {} 件，失败 {} 件，成功率 {:.2f}%", 
+                        result.getSuccessCount(), result.getFailedCount(), successRate);
+                    
+                    // 更新监控数据
+                    migrationMonitor.updateProgress(taskId, totalProcessed, result.getSuccessCount(), result.getFailedCount());
+                }
+                
             } catch (IOException e) {
-                log.error("批量写入失败", e);
+                log.error("批量写入完全失败", e);
                 result.setFailedCount(result.getFailedCount() + bulkRequest.numberOfActions());
             }
         }
@@ -302,19 +536,64 @@ public class EsMigrationServiceImpl implements EsMigrationService {
      * 执行并行迁移
      */
     private void executeParallelMigration(MigrationConfig config, MigrationResult result) throws IOException {
-        ExecutorService executor = Executors.newFixedThreadPool(config.getThreadCount());
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-
-        // 这里可以实现更复杂的并行迁移逻辑
-        // 为简化示例，暂时使用单线程迁移
-        executeSingleThreadMigration(config, result);
-
+        int threadCount = config.getThreadCount();
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        List<CompletableFuture<MigrationResult>> futures = new ArrayList<>();
+        
+        log.info("开始执行并行迁移，线程数: {}", threadCount);
+        
+        // 获取总文档数进行分片
+        long totalCount = getDocumentCount(config.getSourceIndex(), false);
+        long docsPerThread = Math.max(totalCount / threadCount, 1000);
+        
+        for (int i = 0; i < threadCount; i++) {
+            final int shardIndex = i;
+            final long startOffset = i * docsPerThread;
+            final long endOffset = (i == threadCount - 1) ? totalCount : (i + 1) * docsPerThread;
+            
+            CompletableFuture<MigrationResult> future = CompletableFuture.supplyAsync(() -> {
+                try {
+                    return executeShardMigration(config, shardIndex, startOffset, endOffset);
+                } catch (Exception e) {
+                    log.error("分片 {} 迁移失败", shardIndex, e);
+                    MigrationResult shardResult = new MigrationResult();
+                    shardResult.setErrorMessage("分片迁移失败: " + e.getMessage());
+                    return shardResult;
+                }
+            }, executor);
+            futures.add(future);
+        }
+        
+        // 等待所有分片完成并合并结果
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        
+        for (CompletableFuture<MigrationResult> future : futures) {
+            try {
+                MigrationResult shardResult = future.get();
+                result.setSuccessCount(result.getSuccessCount() + shardResult.getSuccessCount());
+                result.setFailedCount(result.getFailedCount() + shardResult.getFailedCount());
+                result.setSkippedCount(result.getSkippedCount() + shardResult.getSkippedCount());
+                if (shardResult.getErrorMessage() != null) {
+                    String currentError = result.getErrorMessage();
+                    result.setErrorMessage(currentError == null ? shardResult.getErrorMessage() : 
+                        currentError + "; " + shardResult.getErrorMessage());
+                }
+            } catch (Exception e) {
+                log.error("获取分片结果失败", e);
+                result.setErrorMessage("分片结果合并失败: " + e.getMessage());
+            }
+        }
+        
         executor.shutdown();
         try {
-            executor.awaitTermination(1, TimeUnit.HOURS);
+            if (!executor.awaitTermination(2, TimeUnit.HOURS)) {
+                log.warn("并行迁移超时，强制关闭线程池");
+                executor.shutdownNow();
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             log.error("并行迁移被中断", e);
+            executor.shutdownNow();
         }
     }
 
@@ -585,5 +864,207 @@ public class EsMigrationServiceImpl implements EsMigrationService {
         }
 
         return estimatedCount;
+    }
+    
+    /**
+     * 执行分片迁移
+     */
+    private MigrationResult executeShardMigration(MigrationConfig config, int shardIndex, long startOffset, long endOffset) throws IOException {
+        MigrationResult result = new MigrationResult();
+        String threadName = "Migration-Shard-" + shardIndex;
+        Thread.currentThread().setName(threadName);
+        
+        log.info("分片 {} 开始迁移，文档范围: {} - {}", shardIndex, startOffset, endOffset);
+        
+        SearchRequest searchRequest = new SearchRequest(config.getSourceIndex());
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        searchSourceBuilder.query(QueryBuilders.matchAllQuery());
+        
+        // 动态调整批次大小
+        int dynamicBatchSize = adjustBatchSizeForShard(config.getBatchSize(), shardIndex);
+        searchSourceBuilder.size(dynamicBatchSize);
+        searchSourceBuilder.trackTotalHits(true);
+        
+        // 添加分片排序，确保数据分布均匀
+        searchSourceBuilder.sort("_doc");
+        
+        searchRequest.source(searchSourceBuilder);
+        searchRequest.scroll(TimeValue.timeValueMinutes(config.getScrollTimeout()));
+
+        SearchResponse searchResponse = esQueryHelper.searchWithRetry(sourceClient, searchRequest, true, 3);
+        String scrollId = searchResponse.getScrollId();
+        SearchHit[] searchHits = searchResponse.getHits().getHits();
+        
+        long processedInShard = 0;
+        long targetDocsInShard = endOffset - startOffset;
+        
+        while (searchHits != null && searchHits.length > 0 && processedInShard < targetDocsInShard) {
+            // 如果超过了分片目标数量，只处理剩余的
+            int actualProcessCount = (int) Math.min(searchHits.length, targetDocsInShard - processedInShard);
+            SearchHit[] actualHits = Arrays.copyOf(searchHits, actualProcessCount);
+            
+            processShardBatch(actualHits, config, result, shardIndex);
+            processedInShard += actualProcessCount;
+            
+            // 记录分片进度
+            double progress = (double) processedInShard / targetDocsInShard * 100;
+            if (processedInShard % (dynamicBatchSize * 10) == 0) {
+                log.info("分片 {} 进度: {:.1f}% ({}/{} docs)", shardIndex, progress, processedInShard, targetDocsInShard);
+            }
+            
+            if (processedInShard >= targetDocsInShard) {
+                break;
+            }
+
+            SearchScrollRequest scrollRequest = new SearchScrollRequest(scrollId);
+            scrollRequest.scroll(TimeValue.timeValueMinutes(config.getScrollTimeout()));
+            
+            try {
+                searchResponse = esQueryHelper.scrollWithRetry(sourceClient, scrollRequest, true, 3);
+                scrollId = searchResponse.getScrollId();
+                searchHits = searchResponse.getHits().getHits();
+            } catch (IOException e) {
+                log.error("分片 {} 滚动查询失败: {}", shardIndex, e.getMessage());
+                throw e;
+            }
+        }
+        
+        log.info("分片 {} 迁移完成，处理文档数: {}, 成功: {}, 失败: {}", 
+                shardIndex, processedInShard, result.getSuccessCount(), result.getFailedCount());
+        
+        return result;
+    }
+    
+    /**
+     * 处理分片批次数据
+     */
+    private void processShardBatch(SearchHit[] hits, MigrationConfig config, MigrationResult result, int shardIndex) {
+        BulkRequest bulkRequest = new BulkRequest();
+        AtomicLong batchSuccessCount = new AtomicLong(0);
+        AtomicLong batchFailedCount = new AtomicLong(0);
+        
+        for (SearchHit hit : hits) {
+            try {
+                Map<String, Object> sourceData = hit.getSourceAsMap();
+                Map<String, Object> targetData = transformDocument(sourceData, config);
+                
+                IndexRequest indexRequest = new IndexRequest(config.getTargetIndex())
+                        .id(hit.getId())
+                        .source(targetData, XContentType.JSON);
+                
+                bulkRequest.add(indexRequest);
+                
+            } catch (Exception e) {
+                log.error("分片 {} 处理文档失败，ID: {}, 错误: {}", shardIndex, hit.getId(), e.getMessage());
+                batchFailedCount.incrementAndGet();
+            }
+        }
+        
+        if (bulkRequest.numberOfActions() > 0) {
+            try {
+                BulkResponse bulkResponse = targetClient.bulk(bulkRequest, RequestOptions.DEFAULT);
+                
+                // 修复错误计数逻辑
+                if (bulkResponse.hasFailures()) {
+                    Arrays.stream(bulkResponse.getItems())
+                        .forEach(item -> {
+                            if (item.isFailed()) {
+                                batchFailedCount.incrementAndGet();
+                                log.warn("分片 {} 文档写入失败: {}, 原因: {}", 
+                                    shardIndex, item.getId(), item.getFailureMessage());
+                            } else {
+                                batchSuccessCount.incrementAndGet();
+                            }
+                        });
+                } else {
+                    batchSuccessCount.addAndGet(bulkResponse.getItems().length);
+                }
+                
+                result.setSuccessCount(result.getSuccessCount() + batchSuccessCount.get());
+                result.setFailedCount(result.getFailedCount() + batchFailedCount.get());
+                
+            } catch (IOException e) {
+                log.error("分片 {} 批量写入失败", shardIndex, e);
+                result.setFailedCount(result.getFailedCount() + bulkRequest.numberOfActions());
+            }
+        }
+    }
+    
+    /**
+     * 为分片调整批次大小
+     */
+    private int adjustBatchSizeForShard(int baseBatchSize, int shardIndex) {
+        // 不同分片使用略有不同的批次大小，避免同时竞争资源
+        int adjustment = (shardIndex % 3 - 1) * 100; // -100, 0, +100
+        return Math.max(baseBatchSize + adjustment, 100);
+    }
+    
+    /**
+     * 带断点续传的单线程迁移
+     */
+    private void executeSingleThreadMigrationWithCheckpoint(MigrationConfig config, MigrationResult result, 
+                                                           String taskId, Optional<MigrationCheckpoint> checkpointOpt) throws IOException {
+        MigrationCheckpoint checkpoint = checkpointOpt.orElseGet(() -> {
+            MigrationCheckpoint newCheckpoint = new MigrationCheckpoint();
+            newCheckpoint.setTaskId(taskId);
+            newCheckpoint.setSourceIndex(config.getSourceIndex());
+            newCheckpoint.setTargetIndex(config.getTargetIndex());
+            newCheckpoint.setTotalCount(result.getTotalCount());
+            newCheckpoint.setCurrentBatchSize(config.getBatchSize());
+            newCheckpoint.setStatus("RUNNING");
+            newCheckpoint.setConfigSnapshot(JSON.toJSONString(config));
+            return newCheckpoint;
+        });
+        
+        try {
+            log.info("开始单线程迁移，任务ID: {}", taskId);
+            executeSingleThreadMigration(config, result);
+            
+            // 更新最终状态
+            checkpoint.setProcessedCount(result.getSuccessCount() + result.getFailedCount());
+            checkpoint.setSuccessCount(result.getSuccessCount());
+            checkpoint.setFailedCount(result.getFailedCount());
+            checkpoint.setStatus("COMPLETED");
+            checkpointService.saveCheckpoint(checkpoint);
+            
+            log.info("单线程迁移成功完成，任务ID: {}", taskId);
+            
+        } catch (Exception e) {
+            log.error("单线程迁移失败，任务ID: {}, 错误: {}", taskId, e.getMessage());
+            checkpoint.setStatus("FAILED");
+            checkpoint.setErrorMessage(e.getMessage());
+            checkpointService.saveCheckpoint(checkpoint);
+            throw e;
+        }
+    }
+    
+    /**
+     * 带断点续传的并行迁移
+     */
+    private void executeParallelMigrationWithCheckpoint(MigrationConfig config, MigrationResult result, 
+                                                        String taskId, Optional<MigrationCheckpoint> checkpointOpt) throws IOException {
+        try {
+            executeParallelMigration(config, result);
+        } catch (Exception e) {
+            // 保存并行迁移失败信息
+            MigrationCheckpoint checkpoint = new MigrationCheckpoint();
+            checkpoint.setTaskId(taskId);
+            checkpoint.setSourceIndex(config.getSourceIndex());
+            checkpoint.setTargetIndex(config.getTargetIndex());
+            checkpoint.setStatus("FAILED");
+            checkpoint.setErrorMessage(e.getMessage());
+            checkpointService.saveCheckpoint(checkpoint);
+            throw e;
+        }
+    }
+    
+    /**
+     * 生成任务ID
+     */
+    private String generateTaskId(MigrationConfig config) {
+        return String.format("migration_%s_%s_%d", 
+            config.getSourceIndex(), 
+            config.getTargetIndex(), 
+            System.currentTimeMillis());
     }
 }

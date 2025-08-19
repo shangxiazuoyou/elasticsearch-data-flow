@@ -28,10 +28,31 @@ elasticsearch:
   # 响应缓冲区配置
   response:
     buffer:
-      # 响应缓冲区最大限制（字节），调整为500MB以支持大数据量迁移
-      limit: 524288000  # 500MB
-      # 初始缓冲区大小（字节），默认1MB
-      initial: 1048576  # 1MB
+      # 响应缓冲区最大限制（字节），调整为1GB以支持百万级数据迁移
+      limit: 1073741824  # 1GB
+      # 初始缓冲区大小（字节），调整为10MB
+      initial: 10485760  # 10MB
+  
+  # 连接配置 - 优化百万级数据迁移
+  connection:
+    # 最大总连接数
+    max-total: 200
+    # 每个路由最大连接数  
+    max-per-route: 100
+  
+  # 超时配置 - 针对大数据量处理优化
+  timeout:
+    # 连接超时时间（毫秒），增加到30秒
+    connect: 30000
+    # Socket超时时间（毫秒），增加到10分钟
+    socket: 600000
+    # 连接请求超时时间（毫秒），增加到1分钟
+    connection-request: 60000
+  
+  # IO线程配置
+  io:
+    # IO线程数量，0表示使用CPU核数
+    thread-count: 0
 
 # ES迁移任务配置
 es:
@@ -43,8 +64,8 @@ es:
       source-index: doc-develop
       # 目标索引名称
       target-index: doc-develop2
-      # 批次大小
-      batch-size: 1000
+      # 批次大小 - 针对百万级数据优化，初始设置较大值
+      batch-size: 2000
       # 时间戳字段名
       timestamp-field: createTime
       # 忽略大小写的字段（逗号分隔）
@@ -53,3 +74,11 @@ es:
       new-fields: migration_time=now,migration_version=1.0
       # 字段映射（格式：源字段=目标字段，逗号分隔）
       field-mapping:
+    # 断点续传配置
+    checkpoint:
+      # 断点文件存储目录
+      dir: ./checkpoints
+      # 是否启用断点续传
+      enabled: true
+      # 断点保存间隔（处理多少条记录后保存一次断点）
+      save-interval: 10000
